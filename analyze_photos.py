@@ -689,7 +689,7 @@ def call_vlm(image_path: Path) -> dict:
     try:
         img_b64 = encode_image_to_b64(image_path)
     except Exception as e:
-        raise RuntimeError(f"读取图片失败（可能 NAS 掉盘）：{e}")
+        raise RuntimeError(f"读取图片失败：{e}")
 
     exif_info = read_exif(image_path)
     exif_json = json.dumps(exif_info, ensure_ascii=False, default=str)
@@ -721,15 +721,14 @@ def call_vlm(image_path: Path) -> dict:
         "- 画质：画面不清晰、模糊、有残影、虚焦 → 微微降低评分。\n\n"
 
         "【重点照片的处理】\n"
-        "如果画面中含有：孩子/猫咪/宠物题材，这些主题更容易产生高回忆价值，请直接以75分为中心，大幅提高评分”。\n"
+        "如果画面中含有：孩子/猫咪/宠物题材，这些主题更容易产生高回忆价值，请直接以75分为中心，并大幅提高评分”。\n"
 
         "【明显低价值图片的处理】\n"
         "对以下低价值图片，必须将 memory_score 压低到 0~25（最多不超过 39）。\n"
         "- 裸露、低俗、色情或违反公序良俗的图片。\n\n"
         "- 账单、收据、广告、随手拍的杂物、测试图片、屏幕截图等。\n\n"
         
-
-        "【美观分（beauty_score）】\n"
+        "【美观分（beauty_score）评分方法】\n"
         "美观分只评价视觉：构图、光线、清晰度、色彩、主体突出。\n"
         "不要被“孩子/猫/旅行”主题绑架美观分：主题不等于好看。\n"
 
@@ -814,9 +813,68 @@ def main():
     ensure_table(conn)
     city_resolver = get_city_resolver()
 
+    # =======================
+    # 同步删除：NAS/磁盘上已不存在的文件，也从数据库里删除
+    # 只处理当前 IMAGE_DIR 前缀下的记录，避免误删其它历史路径。
+    # =======================
+    image_dir_prefix = str(IMAGE_DIR)
+
+    try:
+        # 用临时表避免 IN (...) 过长导致的 SQLite 参数上限问题
+        conn.execute("DROP TABLE IF EXISTS _temp_existing_paths")
+        conn.execute("CREATE TEMP TABLE _temp_existing_paths (path TEXT PRIMARY KEY)")
+
+        # 批量插入当前扫描到的文件列表
+        CHUNK = 2000
+        total_files = len(imgs)
+        inserted = 0
+        for i in range(0, total_files, CHUNK):
+            chunk = imgs[i : i + CHUNK]
+            conn.executemany(
+                "INSERT OR IGNORE INTO _temp_existing_paths(path) VALUES (?)",
+                [(str(p),) for p in chunk],
+            )
+            inserted += len(chunk)
+            if inserted % 10000 == 0:
+                print(f"[CLEAN] 已写入存在文件清单：{inserted}/{total_files} …")
+
+        # 删除：数据库里有记录，但磁盘上已不存在的文件
+        cur_clean = conn.cursor()
+        before_cnt = cur_clean.execute(
+            "SELECT COUNT(*) FROM photo_scores WHERE path LIKE ?",
+            (image_dir_prefix + "%",),
+        ).fetchone()[0]
+
+        cur_clean.execute(
+            """
+            DELETE FROM photo_scores
+            WHERE path LIKE ?
+              AND NOT EXISTS (
+                    SELECT 1 FROM _temp_existing_paths t
+                    WHERE t.path = photo_scores.path
+              )
+            """,
+            (image_dir_prefix + "%",),
+        )
+        deleted = cur_clean.rowcount if cur_clean.rowcount is not None else 0
+        conn.commit()
+
+        after_cnt = cur_clean.execute(
+            "SELECT COUNT(*) FROM photo_scores WHERE path LIKE ?",
+            (image_dir_prefix + "%",),
+        ).fetchone()[0]
+
+        if deleted > 0:
+            print(f"[CLEAN] 已同步删除 {deleted} 条数据库残留记录（当前目录：{before_cnt} → {after_cnt}）。")
+        else:
+            print("[CLEAN] 数据库与磁盘文件一致，无需清理。")
+
+    except Exception as e:
+        # 清理失败不应影响主流程
+        print(f"[WARN] 同步清理数据库残留记录失败（已忽略，不影响主流程）：{e}")
+
     cur_test = conn.cursor()
     # 只统计当前 IMAGE_DIR 下的已分析照片，避免数据库里其它路径/历史残留影响进度计算
-    image_dir_prefix = str(IMAGE_DIR)
     counted = cur_test.execute(
         "SELECT COUNT(*) FROM photo_scores WHERE path LIKE ?",
         (image_dir_prefix + "%",),

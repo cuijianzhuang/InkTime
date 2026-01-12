@@ -43,8 +43,48 @@ DAILY_PHOTO_QUANTITY = int(getattr(cfg, "DAILY_PHOTO_QUANTITY", 5) or 5)
 if DAILY_PHOTO_QUANTITY < 1:
     DAILY_PHOTO_QUANTITY = 1
 
+
 # review 分页：每页 100 张
 REVIEW_PAGE_SIZE = 100
+
+# /review 日期筛选的可用 MM-DD 列表缓存（避免每次都扫全库）
+_MD_CACHE: dict[str, object] = {"md_list": [], "built_at": 0.0}
+_MD_CACHE_TTL_SEC = 300.0  # 5 分钟
+
+def _load_all_md_list() -> list[str]:
+    """从全库提取所有存在的 MM-DD（去重、排序）。用于前端“随机一天”。"""
+    if not DB_PATH.exists():
+        return []
+
+    # 简单 TTL 缓存
+    import time
+    now = time.time()
+    try:
+        built_at = float(_MD_CACHE.get("built_at") or 0.0)
+    except Exception:
+        built_at = 0.0
+    if (now - built_at) < _MD_CACHE_TTL_SEC:
+        cached = _MD_CACHE.get("md_list")
+        if isinstance(cached, list):
+            return [str(x) for x in cached]
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    rows = c.execute("SELECT exif_json FROM photo_scores").fetchall()
+    conn.close()
+
+    s: set[str] = set()
+    for (exif_json,) in rows:
+        d = extract_date_from_exif(exif_json)
+        if d and len(d) >= 10:
+            md = d[5:10]
+            if len(md) == 5 and md[2] == "-":
+                s.add(md)
+
+    md_list = sorted(s)
+    _MD_CACHE["md_list"] = md_list
+    _MD_CACHE["built_at"] = now
+    return md_list
 
 app = Flask(__name__)
 def _require_webui_enabled() -> None:
@@ -90,8 +130,9 @@ def _make_image_url(path_str: str) -> str:
 # DB helpers
 # --------------------------
 
-def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE):
-    """分页读取 review 数据。返回 (rows, total_count)."""
+
+def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", sort: str = "memory"):
+    """分页读取 review 数据。支持按 MM-DD 过滤与排序。返回 (rows, total_count)."""
     if not DB_PATH.exists():
         raise SystemExit(f"找不到数据库文件: {DB_PATH}")
 
@@ -105,10 +146,39 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # 表名统一为 photo_scores（模型无关）
-    total_count = c.execute("SELECT COUNT(1) FROM photo_scores").fetchone()[0]
+    # 从 exif_json 里提取 datetime，再拼 MM-DD
+    # 期望格式："YYYY:MM:DD HH:MM:SS"（extract_date_from_exif 也按这个假设）
+    dt_expr = "json_extract(exif_json, '$.datetime')"
+    md_expr = f"(substr({dt_expr}, 6, 2) || '-' || substr({dt_expr}, 9, 2))"
 
-    base_sql = """
+    where_sql = ""
+    params: list[object] = []
+
+    md = (md or "").strip()
+    if md and len(md) == 5 and md[2] == "-":
+        where_sql = f"WHERE {dt_expr} IS NOT NULL AND {md_expr} = ?"
+        params.append(md)
+
+    # total_count 也要跟随过滤
+    if where_sql:
+        total_count = c.execute(f"SELECT COUNT(1) FROM photo_scores {where_sql}", params).fetchone()[0]
+    else:
+        total_count = c.execute("SELECT COUNT(1) FROM photo_scores").fetchone()[0]
+
+    # 排序
+    sort = (sort or "memory").strip()
+    if sort == "beauty":
+        order_sql = "ORDER BY COALESCE(beauty_score, -1) DESC, COALESCE(memory_score, -1) DESC, path"
+    elif sort == "time_new":
+        # 直接按 datetime 字符串排序（固定格式下可按字典序比较）；NULL 放最后
+        order_sql = f"ORDER BY ({dt_expr} IS NULL) ASC, {dt_expr} DESC, path"
+    elif sort == "time_old":
+        order_sql = f"ORDER BY ({dt_expr} IS NULL) ASC, {dt_expr} ASC, path"
+    else:
+        # 默认 memory
+        order_sql = "ORDER BY COALESCE(memory_score, -1) DESC, COALESCE(beauty_score, -1) DESC, path"
+
+    base_sql = f"""
         SELECT path,
                caption,
                type,
@@ -122,13 +192,13 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE):
                used_at,
                side_caption
         FROM photo_scores
-        ORDER BY COALESCE(memory_score, -1) DESC,
-                 COALESCE(beauty_score, -1) DESC,
-                 path
+        {where_sql}
+        {order_sql}
         LIMIT ? OFFSET ?
     """
 
-    rows = c.execute(base_sql, (page_size, offset)).fetchall()
+    q_params = list(params) + [page_size, offset]
+    rows = c.execute(base_sql, q_params).fetchall()
 
     conn.close()
     return rows, int(total_count)
@@ -162,6 +232,57 @@ def load_sim_rows():
         """
     ).fetchall()
 
+    conn.close()
+    return rows
+
+
+# 新增：只加载指定日期集合的照片，加速 /sim
+def load_sim_rows_for_dates(dates: list[str]):
+    """只加载指定日期（YYYY-MM-DD）集合内的照片，用于 /sim 加速。"""
+    if not dates:
+        return []
+    if not DB_PATH.exists():
+        raise SystemExit(f"找不到数据库文件: {DB_PATH}")
+
+    # 过滤掉不合法日期字符串，避免 SQL 注入（虽然我们用参数化，但也别喂垃圾）
+    safe_dates = []
+    for d in dates:
+        d = (d or "").strip()
+        if len(d) == 10 and d[4] == "-" and d[7] == "-":
+            safe_dates.append(d)
+    if not safe_dates:
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    dt_expr = "json_extract(exif_json, '$.datetime')"
+    # exif datetime 形如 YYYY:MM:DD HH:MM:SS，取前 10 位并把 : 替换成 - -> YYYY-MM-DD
+    date_expr = f"replace(substr({dt_expr}, 1, 10), ':', '-')"
+
+    placeholders = ",".join(["?"] * len(safe_dates))
+    sql = f"""
+        SELECT path,
+               caption,
+               type,
+               memory_score,
+               beauty_score,
+               reason,
+               side_caption,
+               exif_json,
+               width,
+               height,
+               orientation,
+               used_at,
+               exif_gps_lat,
+               exif_gps_lon,
+               exif_city
+        FROM photo_scores
+        WHERE {dt_expr} IS NOT NULL
+          AND {date_expr} IN ({placeholders})
+    """
+
+    rows = c.execute(sql, tuple(safe_dates)).fetchall()
     conn.close()
     return rows
 
@@ -333,7 +454,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
              data-memory="{m_score if m_score is not None else ''}"
              data-beauty="{b_score if b_score is not None else ''}">
             <div class="img-wrap">
-                <a class="img-link" href="/sim?img={html.escape(img_uri)}" title="打开该照片的模拟器">
+                <a class="img-link" href="/sim?img={html.escape(img_uri)}" title="打开该照片的模拟器" onclick="window.stop();">
                     <img src="{img_uri}" loading="lazy">
                 </a>
             </div>
@@ -357,6 +478,11 @@ def build_html(rows, page: int, page_size: int, total_count: int):
 
     items_str = "\n".join(items_html)
     total_pages = (total_count + page_size - 1) // page_size
+
+    # 从请求参数回填（用于显示）
+    md_q = (request.args.get("md", "") or "").strip()
+    sort_q = (request.args.get("sort", "") or "memory").strip() or "memory"
+    md_hint = f" · 筛选日期 {html.escape(md_q)}" if (md_q and len(md_q) == 5) else ""
 
     html_str = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -577,7 +703,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
   <div class="container">
     <h1>InkTime照片数据库</h1>
     <div class="subtitle">
-      数据库：{html.escape(str(DB_PATH))} · 当前页 {page} · 本页 {len(rows)} 张 · 总计 {total_count} 张（每页 {page_size} 张）
+      数据库：{html.escape(str(DB_PATH))}{md_hint} · 当前页 {page} · 本页 {len(rows)} 张 · 总计 {total_count} 张（每页 {page_size} 张）
     </div>
 
     <div class="controls">
@@ -603,9 +729,12 @@ def build_html(rows, page: int, page_size: int, total_count: int):
         <select id="sortBy">
           <option value="memory">按回忆度</option>
           <option value="beauty">按美观度</option>
+          <option value="time_new">按时间（新→旧）</option>
+          <option value="time_old">按时间（旧→新）</option>
         </select>
       </label>
       <button type="button" id="randomDateBtn">随机一天</button>
+      <button type="button" id="homeBtn">回到首页</button>
     </div>
 
     <div class="controls pager" style="justify-content: space-between;">
@@ -638,105 +767,8 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       const sortSelect = document.getElementById('sortBy');
       const statusLine = document.getElementById('statusLine');
       const randomBtn = document.getElementById('randomDateBtn');
-      const grid = document.querySelector('.grid');
-      const items = Array.from(grid.children);
+      const homeBtn = document.getElementById('homeBtn');
 
-      function mdToDayOfYear(md) {{
-        const parts = md.split("-");
-        if (parts.length !== 2) return null;
-        const m = parseInt(parts[0], 10);
-        const d = parseInt(parts[1], 10);
-        if (!m || !d) return null;
-        const daysBefore = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-        if (m < 1 || m > 12) return null;
-        return daysBefore[m] + d;
-      }}
-
-      function applyFilterSort() {{
-        const mVal = monthSelect.value;
-        const dVal = daySelect.value;
-        const sortBy = sortSelect.value;
-
-        let filterMd = "";
-        if (mVal && dVal) filterMd = mVal + "-" + dVal;
-
-        let visibleItems = items.filter(function (item) {{
-          if (!filterMd) return true;
-          const mdAttr = item.getAttribute('data-md') || "";
-          return mdAttr === filterMd;
-        }});
-
-        items.forEach(function (it) {{ it.style.display = 'none'; }});
-
-        if (sortBy === 'memory' || sortBy === 'beauty') {{
-          const key = sortBy === 'memory' ? 'data-memory' : 'data-beauty';
-          visibleItems.sort(function (a, b) {{
-            const av = parseFloat(a.getAttribute(key) || '-1');
-            const bv = parseFloat(b.getAttribute(key) || '-1');
-            return bv - av;
-          }});
-        }}
-
-        visibleItems.forEach(function (it) {{
-          grid.appendChild(it);
-          it.style.display = '';
-        }});
-
-        if (!filterMd) {{ statusLine.textContent = ''; return; }}
-
-        if (visibleItems.length > 0) {{
-          statusLine.textContent = '找到 ' + visibleItems.length + ' 张 ' + parseInt(mVal, 10) + ' 月 ' + parseInt(dVal, 10) + ' 日 的照片（仅本页范围）。';
-        }} else {{
-          const targetDay = mdToDayOfYear(filterMd);
-          if (!targetDay) {{ statusLine.textContent = '日期格式无效。'; return; }}
-
-          let bestItem = null;
-          let bestDiff = Infinity;
-
-          items.forEach(function (item) {{
-            const mdAttr = item.getAttribute('data-md') || '';
-            const day = mdToDayOfYear(mdAttr);
-            if (!day) return;
-            const diff = Math.abs(day - targetDay);
-            if (diff < bestDiff) {{ bestDiff = diff; bestItem = item; }}
-          }});
-
-          if (!bestItem) {{ statusLine.textContent = '没有找到任何带日期的照片（仅本页范围）。'; return; }}
-
-          const closestDate = bestItem.getAttribute('data-date') || '';
-          let countSame = 0;
-          items.forEach(function (item) {{
-            if (item.getAttribute('data-date') === closestDate) countSame += 1;
-          }});
-
-          statusLine.textContent = '本页没有 ' + parseInt(mVal, 10) + ' 月 ' + parseInt(dVal, 10) +
-            ' 日 的照片。最近的是 ' + closestDate + '，本页共有 ' + countSame + ' 张。';
-        }}
-      }}
-
-      function pickRandomDate() {{
-        const allMd = items
-          .map(function (it) {{ return it.getAttribute('data-md') || ''; }})
-          .filter(function (md) {{ return md && md.length === 5 && md.indexOf('-') === 2; }});
-
-        const uniqueMd = Array.from(new Set(allMd));
-        if (uniqueMd.length === 0) {{
-          statusLine.textContent = '没有任何带日期的照片（仅本页范围），无法随机选择。';
-          return;
-        }}
-
-        const idx = Math.floor(Math.random() * uniqueMd.length);
-        const md = uniqueMd[idx];
-        const parts = md.split('-');
-        if (parts.length !== 2) {{ statusLine.textContent = '随机日期解析失败。'; return; }}
-
-        monthSelect.value = parts[0];
-        daySelect.value = parts[1];
-        applyFilterSort();
-        statusLine.textContent = '随机跳转到 ' + parseInt(parts[0], 10) + ' 月 ' + parseInt(parts[1], 10) + ' 日 的照片（仅本页范围）。';
-      }}
-
-      // 分页按钮
       const currentPage = {page};
       const totalPages = {total_pages};
       const prevBtn = document.getElementById('prevPageBtn');
@@ -744,12 +776,110 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       const prevBtnBottom = document.getElementById('prevPageBtnBottom');
       const nextBtnBottom = document.getElementById('nextPageBtnBottom');
 
-      function goPage(p) {{
-        const url = new URL(window.location.href);
-        url.searchParams.set('page', String(p));
-        window.location.href = url.toString();
+      // 任何跳转前先中断当前页面的图片/资源加载，避免请求排队导致“点击无响应”
+      function navigateTo(urlStr) {{
+        try {{
+          window.stop();
+        }} catch (e) {{
+          // ignore
+        }}
+        window.location.href = urlStr;
       }}
 
+      function getParams() {{
+        const url = new URL(window.location.href);
+        const md = (url.searchParams.get('md') || '').trim();
+        const sort = (url.searchParams.get('sort') || '').trim() || 'memory';
+        const page = parseInt(url.searchParams.get('page') || '1', 10) || 1;
+        return {{ url, md, sort, page }};
+      }}
+
+      function setSelectsFromUrl() {{
+        const p = getParams();
+        // sort
+        if (sortSelect) sortSelect.value = p.sort;
+        // md -> month/day
+        if (p.md && p.md.length === 5 && p.md.indexOf('-') === 2) {{
+          const parts = p.md.split('-');
+          if (parts.length === 2) {{
+            if (monthSelect) monthSelect.value = parts[0];
+            if (daySelect) daySelect.value = parts[1];
+          }}
+          if (statusLine) statusLine.textContent = '当前筛选：' + p.md + '（全库）';
+        }} else {{
+          if (monthSelect) monthSelect.value = '';
+          if (daySelect) daySelect.value = '';
+          if (statusLine) statusLine.textContent = '';
+        }}
+      }}
+
+      function buildReviewUrl(md, sort, page) {{
+        const url = new URL(window.location.href);
+        url.pathname = '/review';
+        if (md && md.length === 5 && md.indexOf('-') === 2) url.searchParams.set('md', md);
+        else url.searchParams.delete('md');
+        if (sort) url.searchParams.set('sort', sort);
+        else url.searchParams.delete('sort');
+        url.searchParams.set('page', String(page || 1));
+        return url.toString();
+      }}
+
+      function goPage(p) {{
+        const params = getParams();
+        navigateTo(buildReviewUrl(params.md, params.sort, p));
+      }}
+
+      function goHome() {{
+        const params = getParams();
+        navigateTo(buildReviewUrl('', params.sort || 'memory', 1));
+      }}
+
+      async function pickRandomDate() {{
+        // 从后端拿“真实存在的日期集合”，前端随机一个，然后让后端按 md 过滤
+        try {{
+          // 先停止当前页面的图片加载，释放连接
+          try {{ window.stop(); }} catch (e) {{}}
+          const resp = await fetch('/api/md_list');
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const data = await resp.json();
+          const arr = Array.isArray(data) ? data : (Array.isArray(data.md_list) ? data.md_list : []);
+          if (!arr.length) {{
+            if (statusLine) statusLine.textContent = '全库没有任何可用日期（exif datetime 缺失）。';
+            return;
+          }}
+          const idx = Math.floor(Math.random() * arr.length);
+          const md = String(arr[idx] || '').trim();
+          const params = getParams();
+          navigateTo(buildReviewUrl(md, params.sort || 'memory', 1));
+        }} catch (e) {{
+          if (statusLine) statusLine.textContent = '随机失败：' + e;
+        }}
+      }}
+
+      function onMonthDayChange() {{
+        const mVal = (monthSelect && monthSelect.value) ? monthSelect.value : '';
+        const dVal = (daySelect && daySelect.value) ? daySelect.value : '';
+        const sortBy = (sortSelect && sortSelect.value) ? sortSelect.value : 'memory';
+
+        if (!mVal && !dVal) {{
+          navigateTo(buildReviewUrl('', sortBy, 1));
+          return;
+        }}
+        if (mVal && dVal) {{
+          const md = mVal + '-' + dVal;
+          navigateTo(buildReviewUrl(md, sortBy, 1));
+          return;
+        }}
+        // 只选了一个，不跳转，避免生成无意义的 md
+      }}
+
+      function onSortChange() {{
+        const params = getParams();
+        const sortBy = (sortSelect && sortSelect.value) ? sortSelect.value : 'memory';
+        navigateTo(buildReviewUrl(params.md, sortBy, 1));
+      }}
+
+      // 分页按钮
       if (prevBtn) {{
         prevBtn.disabled = currentPage <= 1;
         prevBtn.addEventListener('click', () => goPage(Math.max(1, currentPage - 1)));
@@ -767,12 +897,25 @@ def build_html(rows, page: int, page_size: int, total_count: int):
         nextBtnBottom.addEventListener('click', () => goPage(Math.min(totalPages, currentPage + 1)));
       }}
 
-      monthSelect.addEventListener('change', applyFilterSort);
-      daySelect.addEventListener('change', applyFilterSort);
-      sortSelect.addEventListener('change', applyFilterSort);
-      randomBtn.addEventListener('click', pickRandomDate);
+      if (monthSelect) monthSelect.addEventListener('change', onMonthDayChange);
+      if (daySelect) daySelect.addEventListener('change', onMonthDayChange);
+      if (sortSelect) sortSelect.addEventListener('change', onSortChange);
+      if (randomBtn) randomBtn.addEventListener('click', pickRandomDate);
+      if (homeBtn) homeBtn.addEventListener('click', goHome);
 
-      applyFilterSort();
+      // 兜底：用户在图片疯狂加载时点击任何链接/按钮，先 stop()，避免导航请求排队
+      document.addEventListener('click', function (ev) {{
+        const t = ev.target;
+        if (!t) return;
+        const a = t.closest ? t.closest('a') : null;
+        const btn = t.closest ? t.closest('button') : null;
+        // 只要是链接或按钮点击，就先中断当前加载
+        if (a || btn) {{
+          try {{ window.stop(); }} catch (e) {{}}
+        }}
+      }}, true);
+
+      setSelectsFromUrl();
     }});
   </script>
 </body>
@@ -782,7 +925,50 @@ def build_html(rows, page: int, page_size: int, total_count: int):
 
 
 def build_simulator_html(sim_rows, selected_img: str = ""):
+    # 空数据时不要做任何无意义的循环，避免前端 JS 大对象
+    if not sim_rows:
+        sim_rows = []
     items = []
+
+    def _parse_tags(ptype_val) -> list[str]:
+        """把 DB 的 type 字段解析成 tag 数组。
+        兼容三种常见存储：
+        - JSON 数组：   ["人物","日常"]
+        - 伪数组文本：  [人物, 日常] / [人物，日常]
+        - 普通字符串：  人物,日常 / 人物
+        注意：这里是容错解析，目的是不让 /sim 因坏数据 500。
+        """
+        if ptype_val is None:
+            return []
+        s = str(ptype_val).strip()
+        if not s:
+            return []
+
+        # 1) 先尝试严格 JSON
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list):
+                    out = []
+                    for x in arr:
+                        t = str(x).strip()
+                        if t:
+                            out.append(t)
+                    return out
+            except Exception:
+                # JSON 不合法：继续走容错
+                pass
+
+        # 2) 容错：去掉最外层 [] 以及引号，然后按逗号/中文逗号切
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1].strip()
+
+        # 去掉可能出现的引号
+        s = s.replace('"', '').replace("'", "")
+
+        parts = [p.strip() for p in s.replace('，', ',').split(',')]
+        out = [p for p in parts if p]
+        return out
     for (
         path,
         caption,
@@ -807,6 +993,9 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
         if not img_uri:
             continue
 
+        # tags: 保证为数组，优先解析 JSON/容错
+        type_value = _parse_tags(ptype)
+
         items.append({
             "path": img_uri,
             "date": date_str,
@@ -817,7 +1006,7 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
             "lon": gps_lon,
             "side": side_caption or "",
             "caption": caption or "",
-            "type": ptype or "",
+            "type": type_value,
             "reason": reason or "",
             "exif_json": exif_json or "",
             "exif_summary": summarize_exif(exif_json) if exif_json else "",
@@ -834,7 +1023,7 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>墨水屏模拟渲染图</title>
+  <title>墨水屏渲染效果预览</title>
   <style>
     :root {{
       --bg: #0b0c10;
@@ -952,6 +1141,8 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
       padding: 12px;
       box-shadow: var(--shadow2);
       backdrop-filter: blur(10px);
+      font-size: 16px;
+      line-height: 1.75;
     }}
     .meta-title {{
       font-size: 13px;
@@ -1017,6 +1208,173 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
       padding: 10px;
     }}
 
+    .section {{
+      padding-top: 10px;
+      margin-top: 10px;
+      border-top: 1px solid rgba(255,255,255,0.10);
+    }}
+    .section:first-of-type {{
+      padding-top: 0;
+      margin-top: 0;
+      border-top: none;
+    }}
+    .section-title {{
+      display:flex;
+      align-items:center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.78);
+      margin: 0 0 8px;
+      letter-spacing: .2px;
+    }}
+
+    .chips {{
+      display:flex;
+      flex-wrap:wrap;
+      gap: 8px;
+      margin: 12px 0 14px;
+    }}
+    .chip {{
+      display:inline-flex;
+      align-items:center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      line-height: 1;
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.07);
+      color: rgba(255,255,255,0.92);
+      user-select: none;
+    }}
+    .chip-dot {{
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.7);
+      flex: 0 0 8px;
+    }}
+
+    .big-text {{
+      font-size: 13px;
+      line-height: 1.55;
+      color: rgba(255,255,255,0.92);
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 12px;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }}
+
+    details.fold {{
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-top: 18px;
+      font-size: 14px;
+    }}
+    details.fold > summary {{
+      cursor: pointer;
+      list-style: none;
+      outline: none;
+      color: rgba(255,255,255,0.86);
+      font-size: 12px;
+      display:flex;
+      align-items:center;
+      justify-content: space-between;
+      gap: 10px;
+    }}
+    details.fold > summary::-webkit-details-marker {{ display: none; }}
+    .fold-hint {{
+      color: rgba(255,255,255,0.55);
+      font-size: 11px;
+    }}
+
+    .kv-grid {{
+      display:grid;
+      grid-template-columns: 92px 1fr;
+      gap: 8px 10px;
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.45;
+    }}
+    .kv-k {{
+      color: rgba(255,255,255,0.52);
+    }}
+    .kv-v {{
+      color: rgba(255,255,255,0.92);
+      word-break: break-word;
+    }}
+
+    .hero-text {{
+      font-size: 26px;
+      line-height: 1.7;
+      font-weight: 650;
+      margin-bottom: 18px;
+      color: rgba(255,255,255,0.98);
+      word-break: break-word;
+      white-space: pre-wrap;
+    }}
+
+    .sub-text {{
+      font-size: 17px;
+      line-height: 1.8;
+      color: rgba(255,255,255,0.90);
+      margin: 14px 0 18px;
+      word-break: break-word;
+      white-space: pre-wrap;
+    }}
+
+    .score-bars {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      margin: 18px 0 20px;
+    }}
+
+    .score-row {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      color: rgba(255,255,255,0.75);
+    }}
+
+    .score-track {{
+      position: relative;
+      flex: 1;
+      height: 10px;
+      background: rgba(255,255,255,0.12);
+      border-radius: 999px;
+      overflow: hidden;
+    }}
+
+    .score-fill {{
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 0%;
+      border-radius: 999px;
+    }}
+
+    .score-fill.memory {{ background: linear-gradient(90deg, #6fd6ff, #9cffd6); }}
+    .score-fill.beauty {{ background: linear-gradient(90deg, #ffd36f, #ff9f6f); }}
+
+    .score-num {{
+      width: 44px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: rgba(255,255,255,0.9);
+    }}
+
+    #fieldReason {{
+      font-size: 16px;
+      line-height: 1.8;
+      margin-top: 6px;
+    }}
+
     @media (max-width: 560px) {{
       .kpi {{ grid-template-columns: 1fr; }}
       .meta-box {{ min-width: 0; }}
@@ -1026,8 +1384,16 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 <body>
   <div class="container">
     <a class="back" href="/review">← 返回 Review</a>
-    <h1>墨水屏模拟渲染图</h1>
-    <div class="subtitle">屏幕尺寸：480 x 800。</div>
+    <h1>墨水屏渲染效果预览</h1>
+    <div class="subtitle">
+      屏幕尺寸：480 x 800&nbsp;&nbsp;
+      <span style="display:inline-flex; gap:6px; vertical-align:middle;">
+        <span style="width:10px;height:10px;box-sizing:border-box;border-radius:50%;background:#000;border:1px solid rgba(255,255,255,0.70);"></span>
+        <span style="width:10px;height:10px;box-sizing:border-box;border-radius:50%;background:#fff;border:1px solid rgba(255,255,255,0.45);"></span>
+        <span style="width:10px;height:10px;box-sizing:border-box;border-radius:50%;background:#c80000;border:1px solid rgba(255,255,255,0.18);"></span>
+        <span style="width:10px;height:10px;box-sizing:border-box;border-radius:50%;background:#e0b400;border:1px solid rgba(255,255,255,0.18);"></span>
+      </span>
+    </div>
 
     <div class="controls">
       <button type="button" id="rerollBtn">同一天换一张</button>
@@ -1037,51 +1403,60 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 
     <div class="preview-wrap">
       <div class="canvas-box">
-        <h2>预览（渲染到 480 x 800）</h2>
         <canvas id="previewCanvas" width="480" height="800"></canvas>
       </div>
 
       <div class="meta-box">
-        <div class="meta-title">数据库信息</div>
+        <div class="hero-text" id="kpiSide"></div>
 
-        <div class="kpi">
-          <div class="cell">
-            <div class="label">日期</div>
-            <div class="value" id="kpiDate"></div>
+        <div class="chips" id="fieldType"></div>
+
+        <div class="sub-text" id="fieldCaption"></div>
+
+        <div class="score-bars">
+          <div class="score-row">
+            <div>回忆度</div>
+            <div class="score-track">
+              <div class="score-fill memory" id="barMemory"></div>
+            </div>
+            <div class="score-num" id="numMemory"></div>
           </div>
-          <div class="cell">
-            <div class="label">地点</div>
-            <div class="value" id="kpiLocation"></div>
-          </div>
-          <div class="cell">
-            <div class="label">回忆度</div>
-            <div class="value accent" id="kpiMemory"></div>
-          </div>
-          <div class="cell">
-            <div class="label">美观度</div>
-            <div class="value accent" id="kpiBeauty"></div>
-          </div>
-          <div class="cell" style="grid-column: 1 / -1;">
-            <div class="label">文案</div>
-            <div class="value" id="kpiSide"></div>
+          <div class="score-row">
+            <div>美观度</div>
+            <div class="score-track">
+              <div class="score-fill beauty" id="barBeauty"></div>
+            </div>
+            <div class="score-num" id="numBeauty"></div>
           </div>
         </div>
 
-        <div class="field"><div class="label">图片URL</div><div class="value" id="fieldPath"></div></div>
-        <div class="field"><div class="label">原始路径</div><div class="value" id="fieldOrigPath"></div></div>
-        <div class="field"><div class="label">类型</div><div class="value" id="fieldType"></div></div>
-        <div class="field"><div class="label">主caption</div><div class="value" id="fieldCaption"></div></div>
-        <div class="field"><div class="label">理由</div><div class="value" id="fieldReason"></div></div>
-        <div class="field"><div class="label">分辨率</div><div class="value" id="fieldRes"></div></div>
-        <div class="field"><div class="label">方向</div><div class="value" id="fieldOrientation"></div></div>
-        <div class="field"><div class="label">已上屏</div><div class="value" id="fieldUsedAt"></div></div>
-        <div class="field"><div class="label">EXIF摘要</div><div class="value" id="fieldExifSummary"></div></div>
+        <div class="sub-text" id="fieldReason"></div>
 
-        <div class="field" style="margin-top:10px; margin-bottom:6px;">
-          <div class="label">EXIF JSON</div>
-          <div class="value"></div>
-        </div>
-        <div class="mono" id="fieldExifJson"></div>
+        <details class="fold">
+          <summary>
+            <span>更多信息</span>
+            <span class="fold-hint">EXIF / 路径 / 调试</span>
+          </summary>
+
+          <div class="kv-grid">
+            <div class="kv-k">日期</div><div class="kv-v" id="kpiDate"></div>
+            <div class="kv-k">地点</div><div class="kv-v" id="kpiLocation"></div>
+            <div class="kv-k">图片URL</div><div class="kv-v" id="fieldPath"></div>
+            <div class="kv-k">原始路径</div><div class="kv-v" id="fieldOrigPath"></div>
+            <div class="kv-k">分辨率</div><div class="kv-v" id="fieldRes"></div>
+            <div class="kv-k">方向</div><div class="kv-v" id="fieldOrientation"></div>
+            <div class="kv-k">已上屏</div><div class="kv-v" id="fieldUsedAt"></div>
+            <div class="kv-k">EXIF摘要</div><div class="kv-v" id="fieldExifSummary"></div>
+          </div>
+
+          <details class="fold" style="margin-top:10px;">
+            <summary>
+              <span>EXIF JSON</span>
+              <span class="fold-hint">调试</span>
+            </summary>
+            <div class="mono" id="fieldExifJson"></div>
+          </details>
+        </details>
       </div>
     </div>
   </div>
@@ -1106,8 +1481,6 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 
     const kpiDate = document.getElementById('kpiDate');
     const kpiLocation = document.getElementById('kpiLocation');
-    const kpiMemory = document.getElementById('kpiMemory');
-    const kpiBeauty = document.getElementById('kpiBeauty');
     const kpiSide = document.getElementById('kpiSide');
 
     const fieldPath = document.getElementById('fieldPath');
@@ -1120,6 +1493,12 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
     const fieldUsedAt = document.getElementById('fieldUsedAt');
     const fieldExifSummary = document.getElementById('fieldExifSummary');
     const fieldExifJson = document.getElementById('fieldExifJson');
+
+    // 评分条
+    const barMemory = document.getElementById('barMemory');
+    const barBeauty = document.getElementById('barBeauty');
+    const numMemory = document.getElementById('numMemory');
+    const numBeauty = document.getElementById('numBeauty');
 
     let currentDate = null;
     let currentPhoto = null;
@@ -1143,6 +1522,42 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
       const m = String(parseInt(parts[1], 10));
       const d = String(parseInt(parts[2], 10));
       return y + '.' + m + '.' + d;
+    }}
+
+    function escapeHtml(s) {{
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
+
+    function hashToHue(str) {{
+      // 简单稳定 hash -> 0..359
+      let h = 0;
+      const s = String(str || '');
+      for (let i = 0; i < s.length; i++) {{
+        h = (h * 31 + s.charCodeAt(i)) >>> 0;
+      }}
+      return h % 360;
+    }}
+
+    function renderTags(tags) {{
+      if (!Array.isArray(tags) || tags.length === 0) return '';
+      let htmlOut = '';
+      for (const t of tags) {{
+        if (!t) continue;
+        const hue = hashToHue(t);
+        const bg = 'hsla(' + hue + ', 90%, 55%, 0.14)';
+        const bd = 'hsla(' + hue + ', 90%, 55%, 0.30)';
+        const dot = 'hsl(' + hue + ', 90%, 62%)';
+        htmlOut += '<span class="chip" style="background:' + bg + '; border-color:' + bd + ';">'
+          + '<span class="chip-dot" style="background:' + dot + ';"></span>'
+          + escapeHtml(t)
+          + '</span>';
+      }}
+      return htmlOut;
     }}
 
     function safeText(v) {{
@@ -1265,13 +1680,11 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
       if (!photo) {{
         kpiDate.textContent = '';
         kpiLocation.textContent = '';
-        kpiMemory.textContent = '';
-        kpiBeauty.textContent = '';
         kpiSide.textContent = '';
 
         fieldPath.textContent = '';
         fieldOrigPath.textContent = '';
-        fieldType.textContent = '';
+        fieldType.innerHTML = '';
         fieldCaption.textContent = '';
         fieldReason.textContent = '';
         fieldRes.textContent = '';
@@ -1279,30 +1692,39 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
         fieldUsedAt.textContent = '';
         fieldExifSummary.textContent = '';
         fieldExifJson.textContent = '';
+        // 清空评分条
+        barMemory.style.width = '0%';
+        barBeauty.style.width = '0%';
+        numMemory.textContent = '';
+        numBeauty.textContent = '';
         return;
       }}
 
-      const loc = formatLocation(photo.lat, photo.lon, photo.city);
-      const mem = (photo.memory === null || photo.memory === undefined) ? '' : Number(photo.memory).toFixed(1);
-      const bea = (photo.beauty === null || photo.beauty === undefined) ? '' : Number(photo.beauty).toFixed(1);
+      // 填充 meta-box 新结构
+      kpiSide.textContent = photo.side ? '「' + safeText(photo.side) + '」' : '';
+      fieldType.innerHTML = renderTags(photo.type);
+      fieldCaption.textContent = safeText(photo.caption);
 
+      // 评分条
+      const m = photo.memory != null ? Math.max(0, Math.min(100, photo.memory)) : 0;
+      const b = photo.beauty != null ? Math.max(0, Math.min(100, photo.beauty)) : 0;
+      barMemory.style.width = m + '%';
+      barBeauty.style.width = b + '%';
+      numMemory.textContent = m ? m.toFixed(1) : '';
+      numBeauty.textContent = b ? b.toFixed(1) : '';
+
+      fieldReason.textContent = photo.reason ? '评分理由：' + safeText(photo.reason) : '';
+
+      // 更多信息区
+      const loc = formatLocation(photo.lat, photo.lon, photo.city);
       kpiDate.textContent = safeText(photo.date);
       kpiLocation.textContent = safeText(loc);
-      kpiMemory.textContent = safeText(mem);
-      kpiBeauty.textContent = safeText(bea);
-      kpiSide.textContent = safeText(photo.side);
-
       fieldPath.textContent = safeText(photo.path);
       fieldOrigPath.textContent = safeText(photo.orig_path || '');
-      fieldType.textContent = safeText(photo.type);
-      fieldCaption.textContent = safeText(photo.caption);
-      fieldReason.textContent = safeText(photo.reason);
-
       const res = (safeText(photo.width) || safeText(photo.height)) ? (safeText(photo.width) + ' x ' + safeText(photo.height)) : '';
       fieldRes.textContent = res;
       fieldOrientation.textContent = safeText(photo.orientation);
       fieldUsedAt.textContent = safeText(photo.used_at);
-
       fieldExifSummary.textContent = safeText(photo.exif_summary);
       fieldExifJson.textContent = safeText(photo.exif_json);
     }}
@@ -1457,7 +1879,10 @@ def review():
     except Exception:
         page = 1
 
-    rows, total_count = load_rows(page=page, page_size=REVIEW_PAGE_SIZE)
+    md = (request.args.get('md', '') or '').strip()
+    sort = (request.args.get('sort', '') or 'memory').strip() or 'memory'
+
+    rows, total_count = load_rows(page=page, page_size=REVIEW_PAGE_SIZE, md=md, sort=sort)
     if not rows:
         return Response(
             "数据库里没有可展示的数据。请先运行你的分析脚本生成评分与文案。",
@@ -1469,11 +1894,43 @@ def review():
     return Response(html_str, mimetype="text/html; charset=utf-8")
 
 
+# API endpoint for md list
+@app.get('/api/md_list')
+def api_md_list():
+    _require_webui_enabled()
+    md_list = _load_all_md_list()
+    return Response(json.dumps(md_list, ensure_ascii=False), mimetype='application/json; charset=utf-8')
+
+
 @app.get("/sim")
 def sim():
     _require_webui_enabled()
     selected_img = request.args.get("img", "")
-    sim_rows = load_sim_rows()
+
+    # 默认不再全库加载，避免 /sim 页面巨大 JSON 导致浏览器转圈
+    sim_rows = []
+
+    # 仅当从 /review 点进来且参数合法时，按“该日期 + 向前 30 天”加载
+    if selected_img and isinstance(selected_img, str) and selected_img.startswith("/images/"):
+        subpath = selected_img[len("/images/"):]
+        try:
+            p = _safe_join(IMAGE_DIR, subpath)
+        except Exception:
+            p = None
+
+        if p is not None and p.exists() and p.is_file():
+            meta = get_photo_meta_by_path(str(p))
+            base_date = meta.get("date") if meta else ""
+
+            if base_date:
+                try:
+                    from datetime import datetime, timedelta
+                    dt0 = datetime.strptime(base_date, "%Y-%m-%d")
+                    dates = [(dt0 - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(0, 31)]
+                except Exception:
+                    dates = [base_date]
+
+                sim_rows = load_sim_rows_for_dates(dates)
 
     html_str = build_simulator_html(sim_rows, selected_img=selected_img)
     return Response(html_str, mimetype="text/html; charset=utf-8")
